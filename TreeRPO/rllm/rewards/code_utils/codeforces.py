@@ -34,15 +34,21 @@ class Capturing(list):
         sys.stdout = self._stdout
 
 # to run the solution files we're using a timing based approach
-import signal
+import threading
+import _thread
 # stuff for setting up signal timer
 class TimeoutException(Exception):
     pass
-def timeout_handler(signum, frame):
+def timeout_handler():
     print(f"alarm went off")
     # return
-    raise TimeoutException
-signal.signal(signal.SIGALRM, timeout_handler)
+    _thread.interrupt_main()
+
+if sys.platform != "win32":
+    import signal
+    def _signal_handler(signum, frame):
+        timeout_handler()
+    signal.signal(signal.SIGALRM, _signal_handler)
 TIMEOUT = 4  # seconds
 
 EXECUTION_RESULTS = {1: "passed", 0: "false", -1: "timeout", -2: "runtime_error", -3: "returncode:{code}", -4: "compile_error"}
@@ -138,15 +144,26 @@ def process_input_output(inputs, outputs):
 
 def compile_and_get_func(program, which_type, method_name, timeout, debug):
     try:
-        signal.alarm(timeout)
+        timer = None
+        if sys.platform != "win32":
+            signal.alarm(timeout)
+        else:
+            timer = threading.Timer(timeout, timeout_handler)
+            timer.start()
         tmp_sol = RuntimeModule.from_string("tmp_sol", "", program)
         if which_type == CODE_TYPE.call_based and "class Solution" in program:
             tmp = tmp_sol.Solution()
         else:
             tmp = tmp_sol
-        signal.alarm(0)
+        if sys.platform != "win32":
+            signal.alarm(0)
+        elif timer:
+            timer.cancel()
     except Exception as e:
-        signal.alarm(0)
+        if sys.platform != "win32":
+            signal.alarm(0)
+        elif timer:
+            timer.cancel()
         if debug:
             print(f"compilation error = {e}")
         return False
@@ -157,11 +174,22 @@ def compile_and_get_func(program, which_type, method_name, timeout, debug):
         method_name = "code"
     
     try:
-        signal.alarm(timeout)
+        timer = None
+        if sys.platform != "win32":
+            signal.alarm(timeout)
+        else:
+            timer = threading.Timer(timeout, timeout_handler)
+            timer.start()
         method = getattr(tmp, method_name)  # get_attr second arg must be str
-        signal.alarm(0)
+        if sys.platform != "win32":
+            signal.alarm(0)
+        elif timer:
+            timer.cancel()
     except:
-        signal.alarm(0)
+        if sys.platform != "win32":
+            signal.alarm(0)
+        elif timer:
+            timer.cancel()
         e = sys.exc_info()
         if debug:
             print(f"unable to get function error = {e}")
@@ -262,13 +290,24 @@ def execute_cb_code(method, inputs_list, outputs_list, timeout, early_stop=True,
             debug_infos[index] = {}
         outputs = outputs_list[index]
         try:
-            signal.alarm(timeout) 
+            timer = None
+            if sys.platform != "win32":
+                signal.alarm(timeout) 
+            else:
+                timer = threading.Timer(timeout, timeout_handler)
+                timer.start()
             faulthandler.enable()
             exec_outputs = method(*inputs)
-            signal.alarm(0)
+            if sys.platform != "win32":
+                signal.alarm(0)
+            elif timer:
+                timer.cancel()
             faulthandler.disable()
         except Exception as e:
-            signal.alarm(0)
+            if sys.platform != "win32":
+                signal.alarm(0)
+            elif timer:
+                timer.cancel()
             faulthandler.disable()
             if debug:
                 print(f"Standard input runtime error = {e}")
@@ -548,12 +587,14 @@ def reliability_guard(maximum_memory_bytes=None):
     """
 
     if maximum_memory_bytes is not None:
-        import resource
-
-        resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
-        resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
-        if not platform.uname().system == "Darwin":
-            resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
+        try:
+            import resource
+            resource.setrlimit(resource.RLIMIT_AS, (maximum_memory_bytes, maximum_memory_bytes))
+            resource.setrlimit(resource.RLIMIT_DATA, (maximum_memory_bytes, maximum_memory_bytes))
+            if not platform.uname().system == "Darwin":
+                resource.setrlimit(resource.RLIMIT_STACK, (maximum_memory_bytes, maximum_memory_bytes))
+        except ImportError:
+            pass
 
     faulthandler.disable()
 
