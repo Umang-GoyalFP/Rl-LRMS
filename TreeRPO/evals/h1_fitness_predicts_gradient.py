@@ -104,32 +104,25 @@ def generate_children(
     if gen_length <= 0:
         return []
 
+    outputs = model.generate(
+        input_ids=input_ids.repeat(n_children, 1),
+        attention_mask=attention_mask.repeat(n_children, 1),
+        max_new_tokens=gen_length,
+        temperature=temperature,
+        do_sample=True,
+        top_p=1.0,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
     children = []
-    for _ in range(n_children):
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=gen_length,
-            temperature=temperature,
-            do_sample=True,
-            top_p=1.0,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        )
-        full_ids = outputs[0].tolist()
+    for j in range(n_children):
+        full_ids = outputs[j].tolist()
         step_ids = full_ids[len(parent.token_ids):]
-
-        child = EvalTreeNode(
-            token_ids=full_ids,
-            depth=parent.depth + 1,
-        )
+        child = EvalTreeNode(token_ids=full_ids, depth=parent.depth + 1)
         child.step_token_ids = step_ids
-
-        # Check if EOS was generated (sequence ended naturally)
         if tokenizer.eos_token_id in step_ids:
             eos_pos = step_ids.index(tokenizer.eos_token_id)
-            child.token_ids = parent.token_ids + step_ids[: eos_pos + 1]
-            child.step_token_ids = step_ids[: eos_pos + 1]
-
+            child.token_ids = parent.token_ids + step_ids[:eos_pos + 1]
+            child.step_token_ids = step_ids[:eos_pos + 1]
         children.append(child)
 
     return children
@@ -231,30 +224,34 @@ def compute_step_log_probs(
 ):
     """Compute sum-log-prob for each non-root node's step tokens."""
 
-    def _process(node):
+    # Collect all non-root nodes first
+    all_nodes = []
+    def _collect(node):
         if node.depth > 0 and node.step_token_ids and len(node.step_token_ids) > 0:
+            all_nodes.append(node)
+        for c in node.children:
+            _collect(c)
+    _collect(root)
+
+    # Process in batches of 8
+    BATCH = 8
+    for i in range(0, len(all_nodes), BATCH):
+        batch_nodes = all_nodes[i:i+BATCH]
+        for node in batch_nodes:  # still per-node but with cache cleared
             input_ids = torch.tensor([node.token_ids], device=device)
             outputs = model(input_ids=input_ids)
-            logits = outputs.logits  # (1, seq_len, vocab)
-
-            # log-probs of the step tokens
+            logits = outputs.logits
             step_start = len(node.token_ids) - len(node.step_token_ids)
-            # For each position t in [step_start, ..., end-1], the prediction
-            # is at logits[:, t-1, :] predicting token_ids[t]
-            step_log_prob = 0.0
             log_probs_all = torch.log_softmax(logits[0], dim=-1)
+            step_log_prob = 0.0
             for i, tok_id in enumerate(node.step_token_ids):
-                pos = step_start + i  # position in the full sequence
+                pos = step_start + i
                 if pos == 0:
-                    continue  # can't compute log-prob for position 0
+                    continue
                 step_log_prob += log_probs_all[pos - 1, tok_id].item()
-
             node.log_prob = step_log_prob
-
-        for child in node.children:
-            _process(child)
-
-    _process(root)
+            del outputs, logits, log_probs_all
+        torch.cuda.empty_cache()
 
 
 def collect_node_stats(root: EvalTreeNode) -> Tuple[np.ndarray, np.ndarray]:
@@ -437,10 +434,11 @@ def run_h1_experiment(args):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float32 if args.full_precision else torch.float16,
+        dtype=torch.float16,  # fixed deprecated arg too
         trust_remote_code=True,
-        device_map=device,
+        device_map="auto",
     )
+    model = torch.compile(model)
     model.eval()
 
     max_prompt_length = args.max_prompt_length
@@ -515,7 +513,9 @@ def run_h1_experiment(args):
             print(f"  (gradient computation skipped)")
         else:
             model.train()  # need gradients
+            model = model.float()
             grad_norm_sq = compute_tree_gradient_norm(model, tree_root, tokenizer, device)
+            model = model.half()
             model.eval()
             print(f"  ||g||^2 = {grad_norm_sq:.6e}")
 
