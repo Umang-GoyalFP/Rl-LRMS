@@ -5,14 +5,69 @@ channels:
   - huggingface
   - conda-forge
   - defaults
+
 dependencies:
   - python=3.10
   - pytorch=2.5.1
   - pytorch-cuda=12.4
   - pip
+
   - pip:
-    - datasets==3.2.0
-    - huggingface-hub==0.26.5
-    - tqdm==4.67.1
-    - transformers==4.47.0
-    - accelerate
+      # ===== Core ML (STRICT for Qwen compatibility) =====
+      - transformers==4.47.0
+      - accelerate==1.13.0
+      - datasets==3.2.0
+      - huggingface-hub==0.26.5
+      - tokenizers==0.21.4
+      - safetensors==0.7.0
+
+      # ===== Logging / Experiment Tracking =====
+      - wandb==0.25.1
+
+      # ===== Data / Math =====
+      - numpy
+      - pandas
+      - scipy
+      - scikit-learn
+      - pyarrow
+      - tqdm==4.67.3
+
+      # ===== Required Fixes =====
+      - pylatexenc==2.10
+      - sentence-transformers
+
+      # ===== Networking =====
+      - requests
+      - aiohttp
+      - httpx
+
+      # ===== Visualization =====
+      - matplotlib
+
+      # ===== OpenAI / LLM APIs =====
+      - openai==1.52.2
+
+      # ===== Google / Vertex AI stack =====
+      - google-api-core==2.30.0
+      - google-auth==2.49.1
+      - google-cloud-core==2.5.0
+      - google-cloud-storage==2.19.0
+      - google-cloud-bigquery==3.40.1
+      - google-cloud-resource-manager==1.16.0
+      - google-cloud-aiplatform==1.71.1
+      - google-resumable-media==2.8.0
+      - googleapis-common-protos==1.73.0
+      - grpcio==1.78.0
+      - grpcio-status==1.71.2
+
+      # ===== Vertex AI SDK =====
+      - vertexai==1.71.1
+
+      # ===== Async / server (used internally by APIs) =====
+      - fastapi
+      - uvicorn
+      - anyio
+
+      # ===== Optional but commonly required =====
+      - protobuf
+      - pydantic
