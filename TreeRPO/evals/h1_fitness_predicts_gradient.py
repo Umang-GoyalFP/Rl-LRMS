@@ -31,6 +31,8 @@ Usage:
 import argparse
 import json
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import wandb
 import sys
 import math
 import time
@@ -43,9 +45,12 @@ import torch
 from scipy import stats
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+
 # Add project root to path so we can import rllm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+torch.set_float32_matmul_precision('high')
+
 
 from rllm.rewards.rl_reward import rllm_reward_fn
 from evals.fitness_utils import (
@@ -297,44 +302,36 @@ def compute_tree_gradient_norm(
         return 0.0
 
     # Accumulate gradients
-    total_loss = torch.tensor(0.0, device=device, requires_grad=False)
+    
 
+   
+    losses = []
     for node, advantage in node_adv_pairs:
         if not node.step_token_ids or len(node.step_token_ids) == 0:
             continue
-
         input_ids = torch.tensor([node.token_ids], device=device)
         outputs = model(input_ids=input_ids)
-        logits = outputs.logits  # (1, seq_len, vocab)
-
+        logits = outputs.logits
         step_start = len(node.token_ids) - len(node.step_token_ids)
         log_probs_all = torch.log_softmax(logits[0], dim=-1)
-
-        # Sum of log-probs for this step's tokens
         step_log_prob = torch.tensor(0.0, device=device)
         for i, tok_id in enumerate(node.step_token_ids):
             pos = step_start + i
             if pos == 0:
                 continue
             step_log_prob = step_log_prob + log_probs_all[pos - 1, tok_id]
+        losses.append(-advantage * step_log_prob)
 
-        # REINFORCE: loss = -advantage * log_prob  (we want the gradient, sign doesn't matter for norm)
-        node_loss = -advantage * step_log_prob
-        total_loss = total_loss + node_loss
-
-    if total_loss.requires_grad or (isinstance(total_loss, torch.Tensor) and total_loss.grad_fn is not None):
+    if losses:
+        total_loss = torch.stack(losses).sum()
         total_loss.backward()
-
-        # Compute gradient norm
-        grad_norm_sq = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                grad_norm_sq += p.grad.data.pow(2).sum().item()
-
+        grad_norm_sq = sum(p.grad.data.pow(2).sum().item()
+                      for p in model.parameters() if p.grad is not None)
         model.zero_grad()
         return grad_norm_sq
-    else:
-        return 0.0
+    return 0.0
+
+
 
 
 def _collect_node_advantages(node: EvalTreeNode, pairs: list):
@@ -423,6 +420,21 @@ def run_h1_experiment(args):
     print(f"Step length:      {args.step_length}")
     print(f"Temperature:      {args.temperature}")
     print()
+    wandb.init(
+    project="TreeRPO-H1",
+    name=f"h1-{args.model.split('/')[-1]}-b{args.branching_factor}-d{args.max_depth}",
+    config={
+        "model": args.model,
+        "data": args.data,
+        "num_problems": args.num_problems,
+        "branching_factor": args.branching_factor,
+        "max_depth": args.max_depth,
+        "step_length": args.step_length,
+        "max_prompt_length": args.max_prompt_length,
+        "temperature": args.temperature,
+        "seed": args.seed,
+        }
+    )
 
     # Load model and tokenizer
     print("Loading model and tokenizer...")
@@ -432,14 +444,16 @@ def run_h1_experiment(args):
 
     # Use float16 for generation, float32 for gradient computation
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         dtype=torch.float16,  # fixed deprecated arg too
         trust_remote_code=True,
         device_map="auto",
     )
-    model = torch.compile(model)
+    
     model.eval()
+    model.gradient_checkpointing_enable()
 
     max_prompt_length = args.max_prompt_length
     max_response_length = args.step_length * args.max_depth
@@ -513,11 +527,25 @@ def run_h1_experiment(args):
             print(f"  (gradient computation skipped)")
         else:
             model.train()  # need gradients
-            model = model.float()
+            torch.cuda.empty_cache()
+            model = model.float() 
             grad_norm_sq = compute_tree_gradient_norm(model, tree_root, tokenizer, device)
             model = model.half()
             model.eval()
             print(f"  ||g||^2 = {grad_norm_sq:.6e}")
+        wandb.log({
+            "problem_idx": problem['index'],
+            "problem_num": i + 1,
+            "p_hat": fitness['p_hat'],
+            "H": fitness['H'],
+            "rho": fitness['rho'],
+            "F": fitness['F'],
+            "regime": regime,
+            "grad_norm_sq": grad_norm_sq if not math.isinf(grad_norm_sq) else None,
+            "elapsed_s": time.time() - t0,
+            "data_source": problem['data_source'],
+        })
+            
 
         elapsed = time.time() - t0
         print(f"  time: {elapsed:.1f}s\n")
@@ -606,6 +634,36 @@ def run_h1_experiment(args):
     csv_path = output_path.with_suffix('.csv')
     df.to_csv(csv_path, index=False)
     print(f"CSV saved to {csv_path}")
+    if len(valid) >= 3:
+        wandb.log({
+            "final/pearson_r": r_pearson,
+            "final/pearson_p": p_pearson,
+            "final/spearman_r": r_spearman,
+            "final/spearman_p": p_spearman,
+            "final/H_spearman_r": r_H,
+            "final/rho_spearman_r": r_rho,
+            "final/n_trees": len(df),
+            "final/n_valid": len(valid),
+        })
+
+        # Log regime breakdown as a table
+        regime_data = []
+        for regime, group in df.groupby('regime'):
+            gv = group.dropna(subset=['grad_norm_sq'])
+            gv = gv[gv['grad_norm_sq'] > 0]
+            regime_data.append([
+                regime,
+                len(group),
+                group['F'].mean(),
+                gv['grad_norm_sq'].mean() if len(gv) > 0 else float('nan')
+            ])
+        wandb.log({
+            "regime_table": wandb.Table(
+                columns=["regime", "count", "mean_F", "mean_grad_norm_sq"],
+                data=regime_data
+            )
+        })
+    wandb.finish()
 
 
 def parse_args():
