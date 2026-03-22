@@ -1,0 +1,10 @@
+Instructions to install anaconda 
+
+curl -O https://repo.anaconda.com/archive/Anaconda3-2024.10-1-Linux-x86_64.sh
+
+bash ~/Anaconda3-2024.10-1-Linux-x86_64.sh
+Enter yes to agree to the license agreement
+Choose yes
+
+Use conda create -f environment.yaml 
+conda activate pizza
