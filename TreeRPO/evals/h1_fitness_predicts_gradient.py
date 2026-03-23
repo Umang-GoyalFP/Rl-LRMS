@@ -284,28 +284,14 @@ def compute_tree_gradient_norm(
     tokenizer,
     device: torch.device,
 ) -> float:
-    """Compute ||g(T)||^2 — the squared gradient norm from a pseudo-PPO step on tree T.
-
-    We do a simplified REINFORCE-style gradient:
-      g(T) = sum_v A_v * grad log pi(s_v | prefix_v)
-
-    where A_v is the advantage (reward - sibling mean) / (bernoulli_std + eps).
-    We accumulate gradients across all non-pruned nodes, then measure ||g||^2.
-    """
     model.zero_grad()
 
-    # Collect all (node, advantage) pairs
     node_adv_pairs = []
     _collect_node_advantages(root, node_adv_pairs)
 
     if not node_adv_pairs:
         return 0.0
 
-    # Accumulate gradients
-    
-
-   
-    losses = []
     for node, advantage in node_adv_pairs:
         if not node.step_token_ids or len(node.step_token_ids) == 0:
             continue
@@ -320,17 +306,15 @@ def compute_tree_gradient_norm(
             if pos == 0:
                 continue
             step_log_prob = step_log_prob + log_probs_all[pos - 1, tok_id]
-        losses.append(-advantage * step_log_prob)
+        loss = -advantage * step_log_prob
+        loss.backward()
+        del outputs, logits, log_probs_all, loss
+        torch.cuda.empty_cache()
 
-    if losses:
-        total_loss = torch.stack(losses).sum()
-        total_loss.backward()
-        grad_norm_sq = sum(p.grad.data.pow(2).sum().item()
+    grad_norm_sq = sum(p.grad.data.pow(2).sum().item()
                       for p in model.parameters() if p.grad is not None)
-        model.zero_grad()
-        return grad_norm_sq
-    return 0.0
-
+    model.zero_grad()
+    return grad_norm_sq
 
 
 
