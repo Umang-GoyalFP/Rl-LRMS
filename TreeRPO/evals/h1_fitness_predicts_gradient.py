@@ -284,17 +284,20 @@ def compute_tree_gradient_norm(
     tokenizer,
     device: torch.device,
 ) -> float:
-    model.zero_grad()
-
     node_adv_pairs = []
     _collect_node_advantages(root, node_adv_pairs)
 
     if not node_adv_pairs:
         return 0.0
 
+    per_node_energies = []
+
     for node, advantage in node_adv_pairs:
         if not node.step_token_ids or len(node.step_token_ids) == 0:
             continue
+
+        model.zero_grad()  # reset before each node
+
         input_ids = torch.tensor([node.token_ids], device=device)
         outputs = model(input_ids=input_ids)
         logits = outputs.logits
@@ -306,16 +309,21 @@ def compute_tree_gradient_norm(
             if pos == 0:
                 continue
             step_log_prob = step_log_prob + log_probs_all[pos - 1, tok_id]
+
         loss = -advantage * step_log_prob
         loss.backward()
+
+        node_gnorm_sq = sum(
+            p.grad.data.pow(2).sum().item()
+            for p in model.parameters() if p.grad is not None
+        )
+        per_node_energies.append(node_gnorm_sq)
+
         del outputs, logits, log_probs_all, loss
         torch.cuda.empty_cache()
 
-    grad_norm_sq = sum(p.grad.data.pow(2).sum().item()
-                      for p in model.parameters() if p.grad is not None)
     model.zero_grad()
-    return grad_norm_sq
-
+    return float(np.mean(per_node_energies))
 
 
 def _collect_node_advantages(node: EvalTreeNode, pairs: list):
