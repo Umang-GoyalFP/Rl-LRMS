@@ -227,9 +227,8 @@ def classify_tree(fitness: Dict[str, float],
     if F <= tau_low:
         if H < 0.2:  # low entropy → all agree
             return 'dead_correct' if p_hat > 0.5 else 'dead_wrong'
-        else:
-            # high entropy but low F → rho ≈ 1 (already learned)
-            return 'dead_correct'
+    elif F <=tau_low:
+        return 'stale'
     elif F <= tau_high:
         return 'stale'
     else:
