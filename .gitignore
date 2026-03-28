@@ -177,6 +177,9 @@ cython_debug/
 TreeRPO/
 __MACOSX/
 
+# Paper drafts (private, not for version control)
+paper_writting/
+
 # Ignore verl script outputs.
 **/outputs/
 **/wandb/
