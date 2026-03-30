@@ -254,7 +254,7 @@ def compute_step_log_probs(
                 if pos == 0:
                     continue
                 step_log_prob += log_probs_all[pos - 1, tok_id].item()
-            node.log_prob = step_log_prob
+            node.log_prob = step_log_prob / max(len(node.step_token_ids), 1)
             del outputs, logits, log_probs_all
         torch.cuda.empty_cache()
 
@@ -507,7 +507,8 @@ def run_h1_experiment(args):
         node_lps, node_rews = collect_node_stats(tree_root)
 
         # --- Phase 5: Compute F(T) ---
-        fitness = compute_tree_fitness(leaf_rewards, node_lps, node_rews)
+        local_rewards = [c.E_reward for c in tree_root.children]
+        fitness = compute_tree_fitness(local_rewards, node_lps, node_rews)
         regime = classify_tree(fitness)
 
         print(f"  p_hat={fitness['p_hat']:.3f}  H={fitness['H']:.3f}  "
