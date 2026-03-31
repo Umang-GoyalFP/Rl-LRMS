@@ -2,7 +2,7 @@
 Shared utilities for tree fitness evaluation experiments.
 
 Provides:
-  - compute_tree_fitness: F(T) = H(r) * (1 - rho_{pi,r})
+  - compute_tree_fitness: F(T) = p(1-p) * (1 - rho^2)
   - collect_leaf_rewards: gather binary rewards from tree leaves
   - collect_node_stats: gather (log_prob, reward) pairs from all non-root nodes
   - walk_tree: generic DFS over a TreeNode
@@ -174,26 +174,33 @@ def compute_tree_fitness(
     node_log_probs: Optional[np.ndarray] = None,
     node_rewards: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """Compute the tree fitness score F(T) = H(r) * (1 - rho).
+    """Compute the GRPO-aware tree fitness score F(T) = p(1-p) * (1 - rho^2).
+
+    p(1-p) is the Bernoulli variance of leaf pass rate — the exact quantity
+    proven to lower-bound expected policy improvement under GRPO
+    (arXiv:2504.03380).  (1 - rho^2) is the fraction of reward variance
+    unexplained by log-probs (proper R^2 decomposition).
 
     Args:
         leaf_rewards: binary rewards at all leaves of the tree
         node_log_probs: per-node sum-log-probs (non-root).
-                        If None, only the entropy term is returned.
+                        If None, only the variance term is returned.
         node_rewards: per-node propagated rewards (non-root).
                       Same length as node_log_probs.
 
     Returns:
         dict with keys:
             'p_hat':   fraction of correct leaves
-            'H':       binary entropy of p_hat
+            'H':       binary entropy of p_hat (kept for logging)
+            'bern_var': Bernoulli variance p(1-p)
             'rho':     Pearson correlation (or 0 if log_probs not given)
-            'F':       fitness score H * (1 - rho)
+            'F':       fitness score p(1-p) * (1 - rho^2)
             'n_leaves': number of leaves
             'n_nodes':  number of non-root nodes used for rho
     """
     p_hat = float(np.mean(leaf_rewards)) if len(leaf_rewards) > 0 else 0.0
     H = binary_entropy(p_hat)
+    bern_var = p_hat * (1.0 - p_hat)
 
     rho = 0.0
     n_nodes = 0
@@ -201,11 +208,12 @@ def compute_tree_fitness(
         rho = pearson_correlation(node_log_probs, node_rewards)
         n_nodes = len(node_log_probs)
 
-    F = H * (1.0 - rho)
+    F = bern_var * (1.0 - rho ** 2)
 
     return {
         'p_hat': p_hat,
         'H': H,
+        'bern_var': bern_var,
         'rho': rho,
         'F': F,
         'n_leaves': len(leaf_rewards),
@@ -214,21 +222,25 @@ def compute_tree_fitness(
 
 
 def classify_tree(fitness: Dict[str, float],
-                  tau_low: float = 0.2,
-                  tau_high: float = 0.8) -> str:
+                  tau_low: float = 0.025,
+                  tau_high: float = 0.10) -> str:
     """Classify a tree into regimes based on fitness.
+
+    F(T) = p(1-p) * (1 - rho^2) ranges in [0, 0.25].
+    Thresholds are scaled accordingly (old 0.2/0.8 on [0,2] ->
+    0.025/0.10 on [0,0.25]).
 
     Returns one of: 'dead_correct', 'dead_wrong', 'stale', 'informative'.
     """
     F = fitness['F']
     p_hat = fitness['p_hat']
-    H = fitness['H']
+    bern_var = fitness['bern_var']
 
     if F <= tau_low:
-        if H < 0.2:  # low entropy → all agree
+        if bern_var < 0.05:  # low variance → all agree
             return 'dead_correct' if p_hat > 0.5 else 'dead_wrong'
         else:
-            # high entropy but low F → rho ≈ 1 (already learned)
+            # high variance but low F → rho ≈ 1 (already learned)
             return 'dead_correct'
     elif F <= tau_high:
         return 'stale'

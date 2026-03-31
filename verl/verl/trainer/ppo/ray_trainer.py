@@ -1340,15 +1340,15 @@ class RayPPOTrainer(object):
 
             n_roots = len(level_node_list[0])
             fitness_metrics['fitness/mean_F'] = np.mean([f['F'] for f in tree_fitness_list])
-            fitness_metrics['fitness/mean_H'] = np.mean([f['H'] for f in tree_fitness_list])
+            fitness_metrics['fitness/mean_bern_var'] = np.mean([f['bern_var'] for f in tree_fitness_list])
             fitness_metrics['fitness/mean_rho'] = np.mean([f['rho'] for f in tree_fitness_list])
             fitness_metrics['fitness/dead_correct_pct'] = tree_regimes['dead_correct'] / max(n_roots, 1)
             fitness_metrics['fitness/dead_wrong_pct'] = tree_regimes['dead_wrong'] / max(n_roots, 1)
             fitness_metrics['fitness/stale_pct'] = tree_regimes['stale'] / max(n_roots, 1)
             fitness_metrics['fitness/informative_pct'] = tree_regimes['informative'] / max(n_roots, 1)
 
-            print(f"[CATPO] Fitness: F={fitness_metrics['fitness/mean_F']:.3f}, "
-                  f"H={fitness_metrics['fitness/mean_H']:.3f}, "
+            print(f"[CATPO] Fitness: F={fitness_metrics['fitness/mean_F']:.4f}, "
+                  f"p(1-p)={fitness_metrics['fitness/mean_bern_var']:.3f}, "
                   f"rho={fitness_metrics['fitness/mean_rho']:.3f}")
             print(f"[CATPO] Regimes: {tree_regimes}")
 

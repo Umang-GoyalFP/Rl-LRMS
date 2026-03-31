@@ -430,8 +430,8 @@ def run_h2_experiment(args):
         fitness_before = compute_tree_fitness(leaf_rewards_before, node_lps, node_rews)
         regime = classify_tree(fitness_before)
 
-        print(f"  BEFORE: p_hat={fitness_before['p_hat']:.3f}  H={fitness_before['H']:.3f}  "
-              f"rho={fitness_before['rho']:.3f}  F={fitness_before['F']:.3f}  regime={regime}")
+        print(f"  BEFORE: p_hat={fitness_before['p_hat']:.3f}  bern_var={fitness_before['bern_var']:.3f}  "
+              f"rho={fitness_before['rho']:.3f}  F={fitness_before['F']:.4f}  regime={regime}")
 
         row = {
             'tree_idx': i,
@@ -439,7 +439,7 @@ def run_h2_experiment(args):
             'data_source': problem['data_source'],
             'regime': regime,
             'F_before': fitness_before['F'],
-            'H_before': fitness_before['H'],
+            'bern_var_before': fitness_before['bern_var'],
             'rho_before': fitness_before['rho'],
             'p_hat_before': fitness_before['p_hat'],
             'n_leaves_before': fitness_before['n_leaves'],
@@ -510,8 +510,8 @@ def run_h2_experiment(args):
             if delta_F > 0:
                 n_improved += 1
 
-            print(f"  AFTER:  p_hat={fitness_after['p_hat']:.3f}  H={fitness_after['H']:.3f}  "
-                  f"rho={fitness_after['rho']:.3f}  F={fitness_after['F']:.3f}")
+            print(f"  AFTER:  p_hat={fitness_after['p_hat']:.3f}  bern_var={fitness_after['bern_var']:.3f}  "
+                  f"rho={fitness_after['rho']:.3f}  F={fitness_after['F']:.4f}")
             print(f"  ΔF = {delta_F:+.3f}  ({'improved' if delta_F > 0 else 'no improvement'})")
 
             # Count how many refinements were correct
@@ -525,7 +525,7 @@ def run_h2_experiment(args):
                 'n_refinements': len(refinements),
                 'n_ref_correct': n_ref_correct,
                 'F_after': fitness_after['F'],
-                'H_after': fitness_after['H'],
+                'bern_var_after': fitness_after['bern_var'],
                 'rho_after': fitness_after['rho'],
                 'p_hat_after': fitness_after['p_hat'],
                 'n_leaves_after': fitness_after['n_leaves'],

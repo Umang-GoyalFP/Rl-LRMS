@@ -2,9 +2,9 @@
 """
 H1 Validation: Does F(T) predict gradient utility?
 
-Hypothesis: The fitness score F(T) = H(r) * (1 - rho_{pi,r}) correlates
+Hypothesis: The fitness score F(T) = p(1-p) * (1 - rho^2) correlates
 positively with the squared gradient norm ||g(T)||^2 that tree T would
-produce during a PPO/GRPO training step.
+produce during a GRPO training step.
 
 Protocol:
   1. Load a pretrained/checkpoint model and tokenizer
@@ -12,7 +12,7 @@ Protocol:
   3. For each problem, build an N-ary tree of depth D via step-level sampling
   4. Score leaves with the rule-based verifier
   5. Propagate rewards bottom-up (as in TreeRPO)
-  6. Compute F(T) per tree  (H and rho)
+  6. Compute F(T) per tree  (p(1-p) and rho)
   7. Compute per-tree gradient norms via a single forward+backward pass
   8. Report Pearson/Spearman correlation between F and ||g||^2
 
@@ -506,8 +506,8 @@ def run_h1_experiment(args):
         fitness = compute_tree_fitness(leaf_rewards, node_lps, node_rews)
         regime = classify_tree(fitness)
 
-        print(f"  p_hat={fitness['p_hat']:.3f}  H={fitness['H']:.3f}  "
-              f"rho={fitness['rho']:.3f}  F={fitness['F']:.3f}  regime={regime}")
+        print(f"  p_hat={fitness['p_hat']:.3f}  bern_var={fitness['bern_var']:.3f}  "
+              f"rho={fitness['rho']:.3f}  F={fitness['F']:.4f}  regime={regime}")
 
         # --- Phase 6: Compute gradient norm ---
         if args.skip_gradient:
@@ -562,11 +562,11 @@ def run_h1_experiment(args):
         print(f"  Spearman r = {r_spearman:.4f}  (p = {p_spearman:.4e})")
 
         # Also correlate individual terms
-        r_H, p_H = stats.spearmanr(valid['H'].values, log_gnorm)
-        r_rho, p_rho = stats.spearmanr(1.0 - valid['rho'].values, log_gnorm)
+        r_bv, p_bv = stats.spearmanr(valid['bern_var'].values, log_gnorm)
+        r_rho2, p_rho2 = stats.spearmanr(1.0 - valid['rho'].values ** 2, log_gnorm)
         print(f"\nIndividual term correlations (Spearman):")
-        print(f"  H(r) vs log(1+||g||^2):     r = {r_H:.4f}  (p = {p_H:.4e})")
-        print(f"  (1-rho) vs log(1+||g||^2):   r = {r_rho:.4f}  (p = {p_rho:.4e})")
+        print(f"  p(1-p) vs log(1+||g||^2):    r = {r_bv:.4f}  (p = {p_bv:.4e})")
+        print(f"  (1-rho^2) vs log(1+||g||^2): r = {r_rho2:.4f}  (p = {p_rho2:.4e})")
 
         # Regime breakdown
         print(f"\nRegime distribution:")
@@ -582,8 +582,8 @@ def run_h1_experiment(args):
             'pearson_p': p_pearson,
             'spearman_r': r_spearman,
             'spearman_p': p_spearman,
-            'H_spearman_r': r_H,
-            'rho_spearman_r': r_rho,
+            'bern_var_spearman_r': r_bv,
+            'rho2_spearman_r': r_rho2,
             'n_trees': len(df),
             'n_valid': len(valid),
         }
