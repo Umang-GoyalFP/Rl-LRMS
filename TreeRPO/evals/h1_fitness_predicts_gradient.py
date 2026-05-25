@@ -44,7 +44,8 @@ import pandas as pd
 import torch
 from scipy import stats
 from transformers import AutoTokenizer, AutoModelForCausalLM
-
+from accelerate import Accelerator
+accelerator = Accelerator()
 
 # Add project root to path so we can import rllm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -412,21 +413,22 @@ def run_h1_experiment(args):
     print(f"Step length:      {args.step_length}")
     print(f"Temperature:      {args.temperature}")
     print()
-    wandb.init(
-    project="TreeRPO-H1",
-    name=f"h1-{args.model.split('/')[-1]}-b{args.branching_factor}-d{args.max_depth}",
-    config={
-        "model": args.model,
-        "data": args.data,
-        "num_problems": args.num_problems,
-        "branching_factor": args.branching_factor,
-        "max_depth": args.max_depth,
-        "step_length": args.step_length,
-        "max_prompt_length": args.max_prompt_length,
-        "temperature": args.temperature,
-        "seed": args.seed,
-        }
-    )
+    if accelerator.is_main_process:
+        wandb.init(
+        project="TreeRPO-H1",
+        name=f"h1-{args.model.split('/')[-1]}-b{args.branching_factor}-d{args.max_depth}",
+        config={
+            "model": args.model,
+            "data": args.data,
+            "num_problems": args.num_problems,
+            "branching_factor": args.branching_factor,
+            "max_depth": args.max_depth,
+            "step_length": args.step_length,
+            "max_prompt_length": args.max_prompt_length,
+            "temperature": args.temperature,
+            "seed": args.seed,
+            }
+        )
 
     # Load model and tokenizer
     print("Loading model and tokenizer...")
@@ -435,14 +437,13 @@ def run_h1_experiment(args):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Use float16 for generation, float32 for gradient computation
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = accelerator.device
     
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         dtype=torch.float16,  # fixed deprecated arg too
         trust_remote_code=True,
-        device_map="auto",
-    )
+    ).to(device)
     
     model.eval()
     model.gradient_checkpointing_enable()
@@ -454,6 +455,7 @@ def run_h1_experiment(args):
     # Load problems
     print(f"Loading {args.num_problems} problems from {args.data}...")
     problems = load_problems(args.data, args.num_problems, seed=args.seed)
+    problems = problems[accelerator.process_index::accelerator.num_processes]
     print(f"Loaded {len(problems)} problems.\n")
 
     # Results accumulator
@@ -526,18 +528,19 @@ def run_h1_experiment(args):
             model = model.half()
             model.eval()
             print(f"  ||g||^2 = {grad_norm_sq:.6e}")
-        wandb.log({
-            "problem_idx": problem['index'],
-            "problem_num": i + 1,
-            "p_hat": fitness['p_hat'],
-            "H": fitness['H'],
-            "rho": fitness['rho'],
-            "F": fitness['F'],
-            "regime": regime,
-            "grad_norm_sq": grad_norm_sq if not math.isinf(grad_norm_sq) else None,
-            "elapsed_s": time.time() - t0,
-            "data_source": problem['data_source'],
-        })
+        if accelerator.is_main_process:
+            wandb.log({
+                "problem_idx": problem['index'],
+                "problem_num": i + 1,
+                "p_hat": fitness['p_hat'],
+                "H": fitness['H'],
+                "rho": fitness['rho'],
+                "F": fitness['F'],
+                "regime": regime,
+                "grad_norm_sq": grad_norm_sq if not math.isinf(grad_norm_sq) else None,
+                "elapsed_s": time.time() - t0,
+                "data_source": problem['data_source'],
+            })
             
 
         elapsed = time.time() - t0
@@ -560,6 +563,12 @@ def run_h1_experiment(args):
     print("ANALYSIS")
     print("=" * 60)
 
+    
+    all_results = [None] * accelerator.num_processes
+    torch.distributed.all_gather_object(all_results, results)
+    if not accelerator.is_main_process:
+        return
+    results = [r for sub in all_results for r in sub]
     df = pd.DataFrame(results)
 
     # Filter out NaN gradient norms
@@ -628,16 +637,17 @@ def run_h1_experiment(args):
     df.to_csv(csv_path, index=False)
     print(f"CSV saved to {csv_path}")
     if len(valid) >= 3:
-        wandb.log({
-            "final/pearson_r": r_pearson,
-            "final/pearson_p": p_pearson,
-            "final/spearman_r": r_spearman,
-            "final/spearman_p": p_spearman,
-            "final/H_spearman_r": r_H,
-            "final/rho_spearman_r": r_rho,
-            "final/n_trees": len(df),
-            "final/n_valid": len(valid),
-        })
+        if accelerator.is_main_process:
+            wandb.log({
+                "final/pearson_r": r_pearson,
+                "final/pearson_p": p_pearson,
+                "final/spearman_r": r_spearman,
+                "final/spearman_p": p_spearman,
+                "final/H_spearman_r": r_H,
+                "final/rho_spearman_r": r_rho,
+                "final/n_trees": len(df),
+                "final/n_valid": len(valid),
+            })
 
         # Log regime breakdown as a table
         regime_data = []
@@ -650,12 +660,13 @@ def run_h1_experiment(args):
                 group['F'].mean(),
                 gv['grad_norm_sq'].mean() if len(gv) > 0 else float('nan')
             ])
-        wandb.log({
-            "regime_table": wandb.Table(
-                columns=["regime", "count", "mean_F", "mean_grad_norm_sq"],
-                data=regime_data
-            )
-        })
+        if accelerator.is_main_process:
+            wandb.log({
+                "regime_table": wandb.Table(
+                    columns=["regime", "count", "mean_F", "mean_grad_norm_sq"],
+                    data=regime_data
+                )
+            })
     wandb.finish()
 
 
