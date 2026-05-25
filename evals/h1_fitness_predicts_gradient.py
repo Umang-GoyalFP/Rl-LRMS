@@ -2,9 +2,9 @@
 """
 H1 Validation: Does F(T) predict gradient utility?
 
-Hypothesis: The fitness score F(T) = p(1-p) * (1 - rho^2) correlates
+Hypothesis: The fitness score F(T) = H(r) * (1 - rho_{pi,r}) correlates
 positively with the squared gradient norm ||g(T)||^2 that tree T would
-produce during a GRPO training step.
+produce during a PPO/GRPO training step.
 
 Protocol:
   1. Load a pretrained/checkpoint model and tokenizer
@@ -12,7 +12,7 @@ Protocol:
   3. For each problem, build an N-ary tree of depth D via step-level sampling
   4. Score leaves with the rule-based verifier
   5. Propagate rewards bottom-up (as in TreeRPO)
-  6. Compute F(T) per tree  (p(1-p) and rho)
+  6. Compute F(T) per tree  (H and rho)
   7. Compute per-tree gradient norms via a single forward+backward pass
   8. Report Pearson/Spearman correlation between F and ||g||^2
 
@@ -31,6 +31,8 @@ Usage:
 import argparse
 import json
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+import wandb
 import sys
 import math
 import time
@@ -42,10 +44,14 @@ import pandas as pd
 import torch
 from scipy import stats
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from accelerate import Accelerator
+accelerator = Accelerator()
 
 # Add project root to path so we can import rllm
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+torch.set_float32_matmul_precision('high')
+
 
 from rllm.rewards.rl_reward import rllm_reward_fn
 from evals.fitness_utils import (
@@ -104,32 +110,25 @@ def generate_children(
     if gen_length <= 0:
         return []
 
+    outputs = model.generate(
+        input_ids=input_ids.repeat(n_children, 1),
+        attention_mask=attention_mask.repeat(n_children, 1),
+        max_new_tokens=gen_length,
+        temperature=temperature,
+        do_sample=True,
+        top_p=1.0,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
     children = []
-    for _ in range(n_children):
-        outputs = model.generate(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=gen_length,
-            temperature=temperature,
-            do_sample=True,
-            top_p=1.0,
-            pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-        )
-        full_ids = outputs[0].tolist()
+    for j in range(n_children):
+        full_ids = outputs[j].tolist()
         step_ids = full_ids[len(parent.token_ids):]
-
-        child = EvalTreeNode(
-            token_ids=full_ids,
-            depth=parent.depth + 1,
-        )
+        child = EvalTreeNode(token_ids=full_ids, depth=parent.depth + 1)
         child.step_token_ids = step_ids
-
-        # Check if EOS was generated (sequence ended naturally)
         if tokenizer.eos_token_id in step_ids:
             eos_pos = step_ids.index(tokenizer.eos_token_id)
-            child.token_ids = parent.token_ids + step_ids[: eos_pos + 1]
-            child.step_token_ids = step_ids[: eos_pos + 1]
-
+            child.token_ids = parent.token_ids + step_ids[:eos_pos + 1]
+            child.step_token_ids = step_ids[:eos_pos + 1]
         children.append(child)
 
     return children
@@ -231,30 +230,34 @@ def compute_step_log_probs(
 ):
     """Compute sum-log-prob for each non-root node's step tokens."""
 
-    def _process(node):
+    # Collect all non-root nodes first
+    all_nodes = []
+    def _collect(node):
         if node.depth > 0 and node.step_token_ids and len(node.step_token_ids) > 0:
+            all_nodes.append(node)
+        for c in node.children:
+            _collect(c)
+    _collect(root)
+
+    # Process in batches of 8
+    BATCH = 8
+    for i in range(0, len(all_nodes), BATCH):
+        batch_nodes = all_nodes[i:i+BATCH]
+        for node in batch_nodes:  # still per-node but with cache cleared
             input_ids = torch.tensor([node.token_ids], device=device)
             outputs = model(input_ids=input_ids)
-            logits = outputs.logits  # (1, seq_len, vocab)
-
-            # log-probs of the step tokens
+            logits = outputs.logits
             step_start = len(node.token_ids) - len(node.step_token_ids)
-            # For each position t in [step_start, ..., end-1], the prediction
-            # is at logits[:, t-1, :] predicting token_ids[t]
-            step_log_prob = 0.0
             log_probs_all = torch.log_softmax(logits[0], dim=-1)
+            step_log_prob = 0.0
             for i, tok_id in enumerate(node.step_token_ids):
-                pos = step_start + i  # position in the full sequence
+                pos = step_start + i
                 if pos == 0:
-                    continue  # can't compute log-prob for position 0
+                    continue
                 step_log_prob += log_probs_all[pos - 1, tok_id].item()
-
-            node.log_prob = step_log_prob
-
-        for child in node.children:
-            _process(child)
-
-    _process(root)
+            node.log_prob = step_log_prob / max(len(node.step_token_ids), 1)
+            del outputs, logits, log_probs_all
+        torch.cuda.empty_cache()
 
 
 def collect_node_stats(root: EvalTreeNode) -> Tuple[np.ndarray, np.ndarray]:
@@ -282,38 +285,25 @@ def compute_tree_gradient_norm(
     tokenizer,
     device: torch.device,
 ) -> float:
-    """Compute ||g(T)||^2 — the squared gradient norm from a pseudo-PPO step on tree T.
-
-    We do a simplified REINFORCE-style gradient:
-      g(T) = sum_v A_v * grad log pi(s_v | prefix_v)
-
-    where A_v is the advantage (reward - sibling mean) / (bernoulli_std + eps).
-    We accumulate gradients across all non-pruned nodes, then measure ||g||^2.
-    """
-    model.zero_grad()
-
-    # Collect all (node, advantage) pairs
     node_adv_pairs = []
     _collect_node_advantages(root, node_adv_pairs)
 
     if not node_adv_pairs:
         return 0.0
 
-    # Accumulate gradients
-    total_loss = torch.tensor(0.0, device=device, requires_grad=False)
+    per_node_energies = []
 
     for node, advantage in node_adv_pairs:
         if not node.step_token_ids or len(node.step_token_ids) == 0:
             continue
 
+        model.zero_grad()  # reset before each node
+
         input_ids = torch.tensor([node.token_ids], device=device)
         outputs = model(input_ids=input_ids)
-        logits = outputs.logits  # (1, seq_len, vocab)
-
+        logits = outputs.logits
         step_start = len(node.token_ids) - len(node.step_token_ids)
         log_probs_all = torch.log_softmax(logits[0], dim=-1)
-
-        # Sum of log-probs for this step's tokens
         step_log_prob = torch.tensor(0.0, device=device)
         for i, tok_id in enumerate(node.step_token_ids):
             pos = step_start + i
@@ -321,23 +311,20 @@ def compute_tree_gradient_norm(
                 continue
             step_log_prob = step_log_prob + log_probs_all[pos - 1, tok_id]
 
-        # REINFORCE: loss = -advantage * log_prob  (we want the gradient, sign doesn't matter for norm)
-        node_loss = -advantage * step_log_prob
-        total_loss = total_loss + node_loss
+        loss = -advantage * step_log_prob
+        loss.backward()
 
-    if total_loss.requires_grad or (isinstance(total_loss, torch.Tensor) and total_loss.grad_fn is not None):
-        total_loss.backward()
+        node_gnorm_sq = sum(
+            p.grad.data.pow(2).sum().item()
+            for p in model.parameters() if p.grad is not None
+        )
+        per_node_energies.append(node_gnorm_sq)
 
-        # Compute gradient norm
-        grad_norm_sq = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                grad_norm_sq += p.grad.data.pow(2).sum().item()
+        del outputs, logits, log_probs_all, loss
+        torch.cuda.empty_cache()
 
-        model.zero_grad()
-        return grad_norm_sq
-    else:
-        return 0.0
+    model.zero_grad()
+    return float(np.mean(per_node_energies))
 
 
 def _collect_node_advantages(node: EvalTreeNode, pairs: list):
@@ -426,6 +413,22 @@ def run_h1_experiment(args):
     print(f"Step length:      {args.step_length}")
     print(f"Temperature:      {args.temperature}")
     print()
+    if accelerator.is_main_process:
+        wandb.init(
+        project="TreeRPO-H1",
+        name=f"h1-{args.model.split('/')[-1]}-b{args.branching_factor}-d{args.max_depth}",
+        config={
+            "model": args.model,
+            "data": args.data,
+            "num_problems": args.num_problems,
+            "branching_factor": args.branching_factor,
+            "max_depth": args.max_depth,
+            "step_length": args.step_length,
+            "max_prompt_length": args.max_prompt_length,
+            "temperature": args.temperature,
+            "seed": args.seed,
+            }
+        )
 
     # Load model and tokenizer
     print("Loading model and tokenizer...")
@@ -434,14 +437,16 @@ def run_h1_experiment(args):
         tokenizer.pad_token_id = tokenizer.eos_token_id
 
     # Use float16 for generation, float32 for gradient computation
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device = accelerator.device
+    
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
-        torch_dtype=torch.float32 if args.full_precision else torch.float16,
+        torch_dtype=torch.float16,  # fixed deprecated arg too
         trust_remote_code=True,
-        device_map=device,
-    )
+    ).to(device)
+    
     model.eval()
+    model.gradient_checkpointing_enable()
 
     max_prompt_length = args.max_prompt_length
     max_response_length = args.step_length * args.max_depth
@@ -450,6 +455,7 @@ def run_h1_experiment(args):
     # Load problems
     print(f"Loading {args.num_problems} problems from {args.data}...")
     problems = load_problems(args.data, args.num_problems, seed=args.seed)
+    problems = problems[accelerator.process_index::accelerator.num_processes]
     print(f"Loaded {len(problems)} problems.\n")
 
     # Results accumulator
@@ -503,11 +509,12 @@ def run_h1_experiment(args):
         node_lps, node_rews = collect_node_stats(tree_root)
 
         # --- Phase 5: Compute F(T) ---
-        fitness = compute_tree_fitness(leaf_rewards, node_lps, node_rews)
+        local_rewards = [c.E_reward for c in tree_root.children]
+        fitness = compute_tree_fitness(local_rewards, node_lps, node_rews)
         regime = classify_tree(fitness)
 
-        print(f"  p_hat={fitness['p_hat']:.3f}  bern_var={fitness['bern_var']:.3f}  "
-              f"rho={fitness['rho']:.3f}  F={fitness['F']:.4f}  regime={regime}")
+        print(f"  p_hat={fitness['p_hat']:.3f}  H={fitness['H']:.3f}  "
+              f"rho={fitness['rho']:.3f}  F={fitness['F']:.3f}  regime={regime}")
 
         # --- Phase 6: Compute gradient norm ---
         if args.skip_gradient:
@@ -515,9 +522,26 @@ def run_h1_experiment(args):
             print(f"  (gradient computation skipped)")
         else:
             model.train()  # need gradients
+            torch.cuda.empty_cache()
+            model = model.float() 
             grad_norm_sq = compute_tree_gradient_norm(model, tree_root, tokenizer, device)
+            model = model.half()
             model.eval()
             print(f"  ||g||^2 = {grad_norm_sq:.6e}")
+        if accelerator.is_main_process:
+            wandb.log({
+                "problem_idx": problem['index'],
+                "problem_num": i + 1,
+                "p_hat": fitness['p_hat'],
+                "H": fitness['H'],
+                "rho": fitness['rho'],
+                "F": fitness['F'],
+                "regime": regime,
+                "grad_norm_sq": grad_norm_sq if not math.isinf(grad_norm_sq) else None,
+                "elapsed_s": time.time() - t0,
+                "data_source": problem['data_source'],
+            })
+            
 
         elapsed = time.time() - t0
         print(f"  time: {elapsed:.1f}s\n")
@@ -539,6 +563,12 @@ def run_h1_experiment(args):
     print("ANALYSIS")
     print("=" * 60)
 
+    
+    all_results = [None] * accelerator.num_processes
+    torch.distributed.all_gather_object(all_results, results)
+    if not accelerator.is_main_process:
+        return
+    results = [r for sub in all_results for r in sub]
     df = pd.DataFrame(results)
 
     # Filter out NaN gradient norms
@@ -562,11 +592,11 @@ def run_h1_experiment(args):
         print(f"  Spearman r = {r_spearman:.4f}  (p = {p_spearman:.4e})")
 
         # Also correlate individual terms
-        r_bv, p_bv = stats.spearmanr(valid['bern_var'].values, log_gnorm)
-        r_rho2, p_rho2 = stats.spearmanr(1.0 - valid['rho'].values ** 2, log_gnorm)
+        r_H, p_H = stats.spearmanr(valid['H'].values, log_gnorm)
+        r_rho, p_rho = stats.spearmanr(1.0 - valid['rho'].values, log_gnorm)
         print(f"\nIndividual term correlations (Spearman):")
-        print(f"  p(1-p) vs log(1+||g||^2):    r = {r_bv:.4f}  (p = {p_bv:.4e})")
-        print(f"  (1-rho^2) vs log(1+||g||^2): r = {r_rho2:.4f}  (p = {p_rho2:.4e})")
+        print(f"  H(r) vs log(1+||g||^2):     r = {r_H:.4f}  (p = {p_H:.4e})")
+        print(f"  (1-rho) vs log(1+||g||^2):   r = {r_rho:.4f}  (p = {p_rho:.4e})")
 
         # Regime breakdown
         print(f"\nRegime distribution:")
@@ -582,8 +612,8 @@ def run_h1_experiment(args):
             'pearson_p': p_pearson,
             'spearman_r': r_spearman,
             'spearman_p': p_spearman,
-            'bern_var_spearman_r': r_bv,
-            'rho2_spearman_r': r_rho2,
+            'H_spearman_r': r_H,
+            'rho_spearman_r': r_rho,
             'n_trees': len(df),
             'n_valid': len(valid),
         }
@@ -606,6 +636,38 @@ def run_h1_experiment(args):
     csv_path = output_path.with_suffix('.csv')
     df.to_csv(csv_path, index=False)
     print(f"CSV saved to {csv_path}")
+    if len(valid) >= 3:
+        if accelerator.is_main_process:
+            wandb.log({
+                "final/pearson_r": r_pearson,
+                "final/pearson_p": p_pearson,
+                "final/spearman_r": r_spearman,
+                "final/spearman_p": p_spearman,
+                "final/H_spearman_r": r_H,
+                "final/rho_spearman_r": r_rho,
+                "final/n_trees": len(df),
+                "final/n_valid": len(valid),
+            })
+
+        # Log regime breakdown as a table
+        regime_data = []
+        for regime, group in df.groupby('regime'):
+            gv = group.dropna(subset=['grad_norm_sq'])
+            gv = gv[gv['grad_norm_sq'] > 0]
+            regime_data.append([
+                regime,
+                len(group),
+                group['F'].mean(),
+                gv['grad_norm_sq'].mean() if len(gv) > 0 else float('nan')
+            ])
+        if accelerator.is_main_process:
+            wandb.log({
+                "regime_table": wandb.Table(
+                    columns=["regime", "count", "mean_F", "mean_grad_norm_sq"],
+                    data=regime_data
+                )
+            })
+    wandb.finish()
 
 
 def parse_args():
