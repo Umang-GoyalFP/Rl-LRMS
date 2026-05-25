@@ -174,51 +174,34 @@ def compute_tree_fitness(
     node_log_probs: Optional[np.ndarray] = None,
     node_rewards: Optional[np.ndarray] = None,
 ) -> Dict[str, float]:
-    """Compute the GRPO-aware tree fitness score F(T) = p(1-p) * (1 - rho^2).
 
-    p(1-p) is the Bernoulli variance of leaf pass rate — the exact quantity
-    proven to lower-bound expected policy improvement under GRPO
-    (arXiv:2504.03380).  (1 - rho^2) is the fraction of reward variance
-    unexplained by log-probs (proper R^2 decomposition).
-
-    Args:
-        leaf_rewards: binary rewards at all leaves of the tree
-        node_log_probs: per-node sum-log-probs (non-root).
-                        If None, only the variance term is returned.
-        node_rewards: per-node propagated rewards (non-root).
-                      Same length as node_log_probs.
-
-    Returns:
-        dict with keys:
-            'p_hat':   fraction of correct leaves
-            'H':       binary entropy of p_hat (kept for logging)
-            'bern_var': Bernoulli variance p(1-p)
-            'rho':     Pearson correlation (or 0 if log_probs not given)
-            'F':       fitness score p(1-p) * (1 - rho^2)
-            'n_leaves': number of leaves
-            'n_nodes':  number of non-root nodes used for rho
-    """
     p_hat = float(np.mean(leaf_rewards)) if len(leaf_rewards) > 0 else 0.0
     H = binary_entropy(p_hat)
     bern_var = p_hat * (1.0 - p_hat)
 
     rho = 0.0
     n_nodes = 0
+    log_var = 0.0  # ADD
+
     if node_log_probs is not None and node_rewards is not None and len(node_log_probs) >= 2:
         rho = pearson_correlation(node_log_probs, node_rewards)
         n_nodes = len(node_log_probs)
-
-    F = bern_var * (1.0 - rho ** 2)
+        v = float(np.var(node_log_probs, ddof=0))  # ADD
+        log_var = v / (v + 1.0)                    # ADD
+        scaled_log_var=log_var*1000
+    F = bern_var * (1.0 - rho ** 2) * scaled_log_var  # CHANGE
 
     return {
         'p_hat': p_hat,
         'H': H,
         'bern_var': bern_var,
         'rho': rho,
+        'log_var': log_var,  # ADD
         'F': F,
         'n_leaves': len(leaf_rewards),
         'n_nodes': n_nodes,
     }
+
 
 
 def classify_tree(fitness: Dict[str, float],
@@ -235,12 +218,10 @@ def classify_tree(fitness: Dict[str, float],
     F = fitness['F']
     p_hat = fitness['p_hat']
     bern_var = fitness['bern_var']
-
     if F <= tau_low:
-        if bern_var < 0.05:  # low variance → all agree
+        if bern_var < 0.05:
             return 'dead_correct' if p_hat > 0.5 else 'dead_wrong'
         else:
-            # high variance but low F → rho ≈ 1 (already learned)
             return 'dead_correct'
     elif F <= tau_high:
         return 'stale'
